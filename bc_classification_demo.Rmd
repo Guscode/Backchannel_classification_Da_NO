@@ -1,0 +1,182 @@
+---
+title: "Backchannel_Classification"
+author: "Gustav Aarup Lauridsen"
+Date: 05/01-2021
+Contact: "https://github.com/Guscode/Backchannel_classification_Da_NO"
+output: html_document
+---
+
+```{r}
+install.packages(pacman)
+library(pacman)
+p_load(udpipe,quanteda,NLP,e1071, randomForest, tidyverse)
+
+#Load the .rda file
+load("bc_classification_demo.rda")
+#Contains
+#1. pod_demo: Dataset for demonstration from Puzzle of Danish
+#2. rf_DA_model2: randomForest model2 as described in "Classifying Backchannels and Explaining Why"
+#3. all_model_features: vector of feature names from the model, which have to be available to the random forest
+
+pod_demo[1:10,]
+rf_DA_model2
+all_model_features
+```
+
+#Adding turn column in the data
+```{r}
+pod_demo$turn <- 0
+t <- 0
+for(i in 2:nrow(pod_demo)){
+  int <- as.character(pod_demo$Interlocutor[i])
+  pint <- as.character(pod_demo$Interlocutor[i-1])
+  if(int != pint){
+    t <- t+1
+  }
+  pod_demo$turn[i] <- t
+}
+```
+
+#Word count
+```{r}
+#Adding wordcount column
+pod_demo$wordcount <- sapply(strsplit(pod_demo$Transcription, " "), length)
+```
+
+
+#Overlap
+```{r}
+#Adding the Overlap feature
+pod_demo$overlap <- 0
+for(i in 1:nrow(pod_demo)){
+  this <- pod_demo[i,]#Subsetting data for specific turn
+  trn <- this$turn[1]
+  if(trn>1){
+    prev <- pod_demo[which(pod_demo$turn == trn-1),]
+    end <- prev[nrow(prev),]$endtime
+    start <- this$starttime
+    pod_demo$overlap[i] <- end-start
+  } 
+}
+pod_demo$overlap <- ifelse(pod_demo$overlap<=0, 0,1)
+```
+
+
+#Lexical and Syntactic alignment
+```{r}
+#Adding unique index
+pod_demo$index <- 1:nrow(pod_demo)
+
+
+#Loading the Danish Udpipe model for lemmatization and part of speech tags
+model <- udpipe_download_model(language = "danish")
+model <- udpipe_load_model(file = model$file_model)
+
+#List of content word tags for lexical alignment
+content_words <- c("ADJ", "ADV", "NOUN", "VERB")
+
+#Counting amount of words per utterance
+pod_demo$wordcount <- sapply(strsplit(pod_demo$Transcription, " "), length)
+#prepping the loop
+prev <- c(" ")
+prev_upos <- c(" ")
+pod_demo$lex_align <- 0
+pod_demo$struc_align <- 0 #This column was wrongly named, and represents syntactic alignment.
+
+
+#Looping through all turns
+for(trn in 0:max(pod_demo$turn)){
+  these <- pod_demo[which(pod_demo$turn == trn),] #Subsetting data for specific turn
+  hm <- udpipe::udpipe_annotate(model, these$Transcription) #Annotating the transcription with udpipe
+  hm <- as.data.frame(hm) #Making udpipe model into dataframe
+  words <- paste(hm[hm$upos %in% content_words,]$lemma, collapse = " ") #Pasting all content word-lemmas into one sentence 
+  c <- c(words,prev) #Combining this turn and previous turn sentences
+  corp_t <- corpus(as.character(c)) #Creating Corpus of sentences
+  dtm_t <- dfm(corp_t) #Creating document-term matrix
+  df <- quanteda::convert(dtm_t, "data.frame") #Converting to dataframe
+  
+  if(ncol(df)>1){  #if df isn't empty
+      pod_demo[which(pod_demo$turn==trn),]$lex_align <-  coop::cosine(as.numeric(df[1,-1]),
+                                                                as.numeric(df[2,-1])) #Calculating cosine similarity
+      prev <- words #Setting this sentence to previous for next iteration
+  } else { #if df is empty, alignment =0
+      pod_demo[which(pod_demo$turn==trn),]$lex_align <- 0
+      prev <- " "
+    }
+
+  if(sum(these$wordcount)>1){ #If there are more than one words in a turn 
+    upos <- paste(unlist(lapply(NLP::ngrams(hm$upos,n=2:3),
+                                FUN=paste, collapse="_")), collapse=" ") #Make all POS tags into Ngrams in a sentence
+    c_upos <- c(upos, prev_upos) #Combine Ngrams from  this turn with Ngrams from previous turn
+    corp_upos <- corpus(as.character(c_upos)) #Make corpus
+    dtm_upos <- dfm(corp_upos) #Make Document-term matrix
+    df_upos <- quanteda::convert(dtm_upos, "data.frame") #Convert to data frame
+    pod_demo[which(pod_demo$turn==trn),]$struc_align <-  coop::cosine(as.numeric(df_upos[1,-1]),
+                                                                   as.numeric(df_upos[2,-1])) #Calculate cosine alignment for ngrams
+    prev_upos <- upos #Set to previous
+  } else{ #If there are only one word in the turn struc_align=0
+    pod_demo[which(pod_demo$turn==trn),]$struc_align <- 0
+    prev_upos <- ""
+  }
+}
+
+
+pod_demo$lex_align <- ifelse(is.nan(pod_demo$lex_align),0,pod_demo$lex_align) #Making NaN's 0
+pod_demo$struc_align <- ifelse(is.nan(pod_demo$struc_align),0,pod_demo$struc_align) #Making NaN's 0
+```
+
+#DTM and DTM_prev
+```{r}
+#Firstly, adding preceeding column to include previous utterance by the other interlocutor and a wordcount of the previous utterance
+pod_demo <- pod_demo %>% 
+  dplyr::mutate(int_lead = lead(Interlocutor))
+pod_demo$change <- ifelse(pod_demo$Interlocutor == pod_demo$int_lead, 0, 1)
+changes <- which(pod_demo$change == 1)
+k_sequence <- pod_demo %>% 
+  mutate(index = 1:nrow(pod_demo))
+pod_demo$preceeding <- ""
+pod_demo$wordcount_prev <- ""
+for (i in seq_along(changes)){
+  k_seq <- k_sequence %>% 
+    dplyr::filter(index>changes[i] & index<=changes[i+1])
+  for (k in seq_along(k_seq$Pair)){
+    pod_demo$preceeding[k_seq$index[k]] <- pod_demo$Transcription[changes[i]]
+    pod_demo$wordcount_prev[k_seq$index[k]] <- pod_demo$wordcount[changes[i]]
+  }
+}
+
+#Removing punctuation and numbers, as Random Forest can't deal with them
+pod_demo$Transcription <-  gsub('\\?','qmark',pod_demo$Transcription)
+pod_demo$Transcription <-  gsub('[[:punct:] ]+',' ',pod_demo$Transcription)
+pod_demo$Transcription <-  gsub('\\d+','tal',pod_demo$Transcription)
+
+#Creating DTM from training data
+corp <-corpus(as.character(pod_demo$Transcription))
+dtm <- dfm(corp)
+dtm <- convert(dtm, to="tm")
+dtm_df <- as.data.frame(as.matrix(dtm))
+
+#Creating dtm from previous line
+corp_prev <- corpus(as.character(pod_demo$preceeding))
+dtm_prev <- dfm(corp_prev)
+dtm_prev <- convert(dtm_prev, to="tm")
+dtm_df_prev <- as.data.frame(as.matrix(dtm_prev))
+names(dtm_df_prev) <- paste(names(dtm_df_prev), "_prev", sep = "")
+dtm_df <- cbind(dtm_df, dtm_df_prev)
+dtm_df <- dtm_df[,names(dtm_df) %in% all_model_features]
+
+#Add binary, wordcount and alignment features to dtm
+dtm_df$wordcount <- pod_demo$wordcount
+dtm_df$wordcount_prev <- pod_demo$wordcount_prev
+dtm_df$lex_align <- pod_demo$lex_align
+dtm_df$struc_align <- pod_demo$struc_align
+dtm_df$overlap <- pod_demo$overlap
+
+#Adding empty columns with the words not used, as they are required for the random forest
+dtm_df[,all_model_features[which(!all_model_features%in% names(dtm_df))]] <- 0
+
+
+#Add predictions to the dataset
+pod_demo$Backchannels <- predict(rf_DA_model2, dtm_df)
+```
+
